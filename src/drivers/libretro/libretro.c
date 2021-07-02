@@ -6,6 +6,7 @@
 #include <ctype.h>
 
 #include <libretro.h>
+#include <compat/fopen_utf8.h>
 #include <streams/memory_stream.h>
 #include <libretro_dipswitch.h>
 #include <libretro_core_options.h>
@@ -49,12 +50,14 @@
 #define RETRO_DEVICE_FC_OEKAKIDS RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_MOUSE,  3)
 #define RETRO_DEVICE_FC_SHADOW   RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_MOUSE,  4)
 #define RETRO_DEVICE_FC_4PLAYERS RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 2)
+#define RETRO_DEVICE_FC_HYPERSHOT RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 3)
 #define RETRO_DEVICE_FC_AUTO     RETRO_DEVICE_JOYPAD
 
 #define NES_WIDTH   256
 #define NES_HEIGHT  240
 #define NES_8_7_PAR  ((width * (8.0 / 7.0)) / height)
 #define NES_4_3      ((width / (height * (256.0 / 240.0))) * 4.0 / 3.0)
+#define NES_PP       ((width / (height * (256.0 / 240.0))) * 16.0 / 15.0)
 
 #if defined(_3DS)
 void* linearMemAlign(size_t size, size_t alignment);
@@ -80,7 +83,7 @@ static bool crop_overscan_v;
 #endif
 
 static bool use_raw_palette;
-static bool use_par;
+static int aspect_ratio_par;
 
 /*
  * Flags to keep track of whether turbo
@@ -162,8 +165,6 @@ static unsigned opt_region = 0;
 static unsigned opt_showAdvSoundOptions = 0;
 static unsigned opt_showAdvSystemOptions = 0;
 
-int FCEUnetplay;
-
 #if defined(PSP) || defined(PS2)
 static __attribute__((aligned(16))) uint16_t retro_palette[256];
 #else
@@ -186,9 +187,6 @@ static uint32_t Dummy = 0;
 static uint32_t current_palette = 0;
 static unsigned serialize_size;
 
-int PPUViewScanline=0;
-int PPUViewer=0;
-
 /* extern forward decls.*/
 extern FCEUGI *GameInfo;
 extern uint8 *XBuf;
@@ -198,8 +196,6 @@ extern int show_crosshair;
 extern int option_ramstate;
 
 /* emulator-specific callback functions */
-
-void UpdatePPUView(int refreshchr) { }
 
 const char * GetKeyboard(void)
 {
@@ -286,9 +282,6 @@ void FCEUD_DispMessage(char *m)
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
 }
 
-void FCEUD_NetworkClose(void)
-{ }
-
 void FCEUD_SoundToggle (void)
 {
    FCEUI_SetSoundVolume(sndvolume);
@@ -297,9 +290,8 @@ void FCEUD_SoundToggle (void)
 FILE *FCEUD_UTF8fopen(const char *n, const char *m)
 {
    if (n)
-      return fopen(n, m);
-   else
-      return NULL;
+      return fopen_utf8(n, m);
+   return NULL;
 }
 
 /*palette for FCEU*/
@@ -765,6 +757,10 @@ static void update_nes_controllers(unsigned port, unsigned device)
          FCEUI_SetInputFC(SIFC_4PLAYER, &nes_input.JSReturn, 0);
          FCEU_printf(" Famicom Expansion: Famicom 4-Player Adapter\n");
          break;
+      case RETRO_DEVICE_FC_HYPERSHOT:
+         FCEUI_SetInputFC(SIFC_HYPERSHOT, nes_input.FamicomData, 0);
+         FCEU_printf(" Famicom Expansion: Konami Hyper Shot\n");
+         break;
       case RETRO_DEVICE_NONE:
       default:
          FCEUI_SetInputFC(SIFC_NONE, &Dummy, 0);
@@ -807,6 +803,8 @@ static unsigned fc_to_libretro(int d)
       return RETRO_DEVICE_FC_OEKAKIDS;
    case SIFC_4PLAYER:
       return RETRO_DEVICE_FC_4PLAYERS;
+   case SIFC_HYPERSHOT:
+      return RETRO_DEVICE_FC_HYPERSHOT;
    }
 
    return (RETRO_DEVICE_NONE);
@@ -918,6 +916,7 @@ void retro_set_environment(retro_environment_t cb)
       { "Auto",                  RETRO_DEVICE_FC_AUTO },
       { "Arkanoid",              RETRO_DEVICE_FC_ARKANOID },
       { "(Bandai) Hyper Shot",   RETRO_DEVICE_FC_SHADOW },
+      { "(Konami) Hyper Shot",   RETRO_DEVICE_FC_HYPERSHOT },
       { "Oeka Kids Tablet",      RETRO_DEVICE_FC_OEKAKIDS },
       { "4-Player Adapter",      RETRO_DEVICE_FC_4PLAYERS },
       { 0, 0 },
@@ -949,6 +948,16 @@ void retro_get_system_info(struct retro_system_info *info)
    info->block_extract    = false;
 }
 
+static float get_aspect_ratio(unsigned width, unsigned height)
+{
+  if (aspect_ratio_par == 2)
+    return NES_4_3;
+  else if (aspect_ratio_par == 3)
+    return NES_PP;
+  else
+    return NES_8_7_PAR;
+}
+
 void retro_get_system_av_info(struct retro_system_av_info *info)
 {
 #ifdef PSP
@@ -967,7 +976,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 #endif
    info->geometry.base_height = height;
    info->geometry.max_height = NES_HEIGHT;
-   info->geometry.aspect_ratio = (float)(use_par ? NES_8_7_PAR : NES_4_3);
+   info->geometry.aspect_ratio = get_aspect_ratio(width, height);
    info->timing.sample_rate = (float)sndsamplerate;
    if (FSettings.PAL || dendy)
       info->timing.fps = 838977920.0/16777215.0;
@@ -1339,12 +1348,16 @@ static void check_variables(bool startup)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      bool newval = (!strcmp(var.value, "8:7 PAR"));
-      if (newval != use_par)
-      {
-         use_par = newval;
-         audio_video_updated = 1;
+      unsigned oldval = aspect_ratio_par;
+      if (!strcmp(var.value, "8:7 PAR")) {
+        aspect_ratio_par = 1;
+      } else if (!strcmp(var.value, "4:3")) {
+        aspect_ratio_par = 2;
+      } else if (!strcmp(var.value, "PP")) {
+        aspect_ratio_par = 3;
       }
+     if (aspect_ratio_par != oldval)
+       audio_video_updated = 1;
    }
 
    var.key = "fceumm_turbo_enable";
@@ -1719,6 +1732,37 @@ static void FCEUD_UpdateInput(void)
       case RETRO_DEVICE_FC_SHADOW:
          get_mouse_input(0, nes_input.FamicomData);
          break;
+      case RETRO_DEVICE_FC_HYPERSHOT:
+      {
+         static int toggle;
+         int i;
+
+         nes_input.FamicomData[0] = 0;
+         toggle ^= 1;
+         for (i = 0; i < 2; i++)
+         {
+            
+            if (input_cb(i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
+               nes_input.FamicomData[0] |= 0x02 << (i * 2);
+            else if (input_cb(i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y))
+            {
+               if (toggle)
+                  nes_input.FamicomData[0] |= 0x02 << (i * 2);
+               else
+                  nes_input.FamicomData[0] &= ~(0x02 << (i * 2));
+            }
+            if (input_cb(i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A))
+               nes_input.FamicomData[0] |= 0x04 << (i * 2);
+            else if (input_cb(i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X))
+            {
+               if (toggle)
+                  nes_input.FamicomData[0] |= 0x04 << (i * 2);
+               else
+                  nes_input.FamicomData[0] &= ~(0x04 << (i * 2));
+            }
+         }
+         break;
+      }
    }
 
    if (input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2))
@@ -2376,6 +2420,7 @@ bool retro_load_game(const struct retro_game_info *game)
    sndvolume = 150;
    swapDuty = 0;
    dendy = 0;
+   opt_region = 0;
 
    /* Wii: initialize this or else last variable is passed through
     * when loading another rom causing save state size change. */
